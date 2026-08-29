@@ -159,15 +159,11 @@ genuine convergence before scaling to a real multi-city seed pool.
   hardcoded constants, not swept or exposed. Lower priority than
   `spawn_scale`, but a conscious deferral, not an oversight.
 
-## What's next (not yet started)
+Next steps
 
-Per the original build plan, still open:
-- Phase 6: scale training to the real multi-city seed pool once single-city
-  convergence is confirmed.
-- Phase 7: formalize the fixed-timer baseline as its own comparable
-  artifact (currently only exists inline inside `tune_params.py` for sweep
-  purposes) — needed for the demo's before/after comparison.
-- Phase 8: visualization (render city + live metrics, baseline vs. agent
-  side by side).
-- Phase 9: demo polish (training curve graph, final metrics, narrative).
-- The stage-2 shared-policy architecture refactor described above.
+In rough priority order given what's been validated so far:
+
+Fixed-timer baseline eval on the same trained city — cheap, and turns the abstract reward improvement into the concrete "X% less wait time, Y% fewer stalls" number the demo actually needs.
+Scale to the real seed pool on the current fixed-size env, to see how much longer convergence takes once city layout varies episode-to-episode (expect meaningfully more than 300k steps).
+Stage-2 shared-policy refactor — the architecture change that actually delivers cross-city-size generalization, which is the headline differentiator in the original pitch.
+Visualization and demo polish (phases 8–9) once there's a policy worth showing off.

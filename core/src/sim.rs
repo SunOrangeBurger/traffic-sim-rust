@@ -1,7 +1,8 @@
 use crate::city::{generate_city, City, CityGenParams, PhaseGroup};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, VecDeque};
 
 /// Fixed number of observation fields emitted per intersection:
 /// [queue_len_NS, queue_len_EW, wait_time_NS, wait_time_EW, current_phase, local_intensity]
@@ -10,8 +11,21 @@ use std::collections::VecDeque;
 /// cities.
 pub const OBS_PER_INTERSECTION: usize = 6;
 
-const MIN_ROUTE_HOPS: usize = 3;
-const MAX_ROUTE_HOPS: usize = 8;
+/// Fraction (0.0..=1.0) by which a vehicle's per-edge routing cost is
+/// randomly jittered when computing its route. This is what produces real
+/// route diversity between vehicles sharing the same origin/destination:
+/// each vehicle effectively solves shortest-path on a slightly different
+/// perceived cost graph (the way real drivers don't all agree on which
+/// route is "best"), rather than every vehicle between the same two points
+/// taking the identical mathematically-optimal path.
+const ROUTE_JITTER: f64 = 0.35;
+
+/// Destinations are sampled biased toward hub/high-zone_weight
+/// intersections (commute-style traffic converging on busy areas) rather
+/// than uniformly at random across the whole city. This exponent controls
+/// how strong that bias is: 1.0 = sample proportional to zone_weight,
+/// higher = more strongly concentrated on the busiest intersections.
+const DESTINATION_HUB_BIAS: f32 = 1.5;
 
 /// Dynamics/reward knobs that are *not* about city shape (that's
 /// `CityGenParams`). Split into its own struct so tuning sweeps can vary
@@ -74,6 +88,33 @@ struct Vehicle {
     stall_count: u32,
 }
 
+/// Min-heap entry for Dijkstra's algorithm over intersections. `BinaryHeap`
+/// is a max-heap by default, so `Ord` is implemented in reverse of `cost` to
+/// turn it into the min-heap the algorithm needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DijkstraState {
+    cost: f64,
+    intersection: usize,
+}
+
+impl Eq for DijkstraState {}
+
+impl Ord for DijkstraState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reversed: BinaryHeap is max-heap, we want smallest cost first.
+        other
+            .cost
+            .partial_cmp(&self.cost)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for DijkstraState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 struct IntersectionState {
     phase: Phase,
 }
@@ -106,6 +147,17 @@ pub struct Simulation {
     tick: u64,
     completed_this_tick: usize,
     stall_events_this_tick: u32,
+    /// Per-intersection wait-tick and stall accumulators for this tick only,
+    /// reset at the top of every step(). Indexed by intersection id (the
+    /// `to` intersection of the road each wait/stall was accrued on) --
+    /// this is what makes a localized per-intersection reward possible:
+    /// each intersection's signal reflects only traffic actually queued at
+    /// its own approaches, not congestion elsewhere in the city. Needed for
+    /// the shared-policy architecture (stage 2) to scale to arbitrary city
+    /// sizes without per-agent reward getting diluted/noisy as the city
+    /// grows.
+    wait_by_intersection: Vec<u64>,
+    stall_by_intersection: Vec<u32>,
 }
 
 impl Simulation {
@@ -126,6 +178,8 @@ impl Simulation {
             tick: 0,
             completed_this_tick: 0,
             stall_events_this_tick: 0,
+            wait_by_intersection: vec![0; n_intersections],
+            stall_by_intersection: vec![0; n_intersections],
             city,
             params,
             config,
@@ -142,28 +196,139 @@ impl Simulation {
         self.observe()
     }
 
-    fn random_route(&mut self, start_road: usize) -> Vec<usize> {
-        let hops = self.rng.gen_range(MIN_ROUTE_HOPS..=MAX_ROUTE_HOPS);
-        let mut route = vec![start_road];
-        let mut current_intersection = self.city.roads[start_road].to;
-        for _ in 1..hops {
-            let outgoing = &self.city.intersections[current_intersection].outgoing;
-            if outgoing.is_empty() {
+    /// Sample a destination intersection, biased toward hub/high-zone_weight
+    /// areas (commute-style convergence on busy districts) rather than
+    /// uniformly across the city. Falls back to uniform if every weight is
+    /// ~0 (e.g. num_hubs=0 edge cases where compute_zone_weights left
+    /// everything flat) so this never panics on a degenerate weight sum.
+    fn sample_destination(&mut self, exclude: usize) -> usize {
+        let weights: Vec<f32> = self
+            .city
+            .intersections
+            .iter()
+            .map(|i| i.zone_weight.max(0.01).powf(DESTINATION_HUB_BIAS))
+            .collect();
+        let total: f32 = weights.iter().sum();
+        if total <= 0.0 || self.city.intersections.len() <= 1 {
+            return exclude;
+        }
+        loop {
+            let mut roll = self.rng.gen_range(0.0..total);
+            let mut chosen = 0usize;
+            for (idx, &w) in weights.iter().enumerate() {
+                if roll < w {
+                    chosen = idx;
+                    break;
+                }
+                roll -= w;
+            }
+            if chosen != exclude {
+                return chosen;
+            }
+            if self.city.intersections.len() <= 1 {
+                return exclude;
+            }
+        }
+    }
+
+    /// Dijkstra shortest path (by free-flow travel cost, congestion-blind by
+    /// design -- recomputing per-spawn against live queue state would be
+    /// expensive and also not how real drivers plan a route before
+    /// departing) from `start_intersection` to `dest_intersection`, over a
+    /// per-vehicle-jittered cost graph so different vehicles between the
+    /// same two points don't all take the identical "optimal" route -- see
+    /// ROUTE_JITTER. Returns the sequence of road ids to traverse, or `None`
+    /// if unreachable (shouldn't happen on a connected grid, but roads
+    /// spawn/prune stochastically so this is checked rather than assumed).
+    fn shortest_route(
+        &mut self,
+        start_intersection: usize,
+        dest_intersection: usize,
+    ) -> Option<Vec<usize>> {
+        if start_intersection == dest_intersection {
+            return None;
+        }
+        let n = self.city.intersections.len();
+        let mut dist = vec![f64::INFINITY; n];
+        let mut via_road: Vec<Option<usize>> = vec![None; n];
+        let mut prev_intersection: Vec<Option<usize>> = vec![None; n];
+        dist[start_intersection] = 0.0;
+
+        let mut heap = BinaryHeap::new();
+        heap.push(DijkstraState {
+            cost: 0.0,
+            intersection: start_intersection,
+        });
+
+        // Precompute this vehicle's personal jitter per-road up front so the
+        // relaxation loop below doesn't call the RNG (keeps the algorithm's
+        // correctness easy to reason about) -- one jitter draw per road in
+        // the city, still cheap at this city scale.
+        let jitters: Vec<f64> = (0..self.city.roads.len())
+            .map(|_| 1.0 + self.rng.gen_range(-ROUTE_JITTER..=ROUTE_JITTER))
+            .collect();
+
+        while let Some(DijkstraState { cost, intersection }) = heap.pop() {
+            if intersection == dest_intersection {
                 break;
             }
-            let prev_road = *route.last().unwrap();
-            // avoid an immediate U-turn back the way we came, when an alternative exists
-            let choice: Vec<usize> = outgoing
-                .iter()
-                .filter(|&&r| self.city.roads[r].to != self.city.roads[prev_road].from)
-                .copied()
-                .collect();
-            let pool = if choice.is_empty() { outgoing.clone() } else { choice };
-            let next = pool[self.rng.gen_range(0..pool.len())];
-            current_intersection = self.city.roads[next].to;
-            route.push(next);
+            if cost > dist[intersection] {
+                continue; // stale heap entry
+            }
+            for &road_id in &self.city.intersections[intersection].outgoing {
+                let road = &self.city.roads[road_id];
+                let base_cost = (road.length as f64 / road.capacity.max(1) as f64).max(0.01);
+                let edge_cost = base_cost * jitters[road_id];
+                let next_cost = cost + edge_cost;
+                if next_cost < dist[road.to] {
+                    dist[road.to] = next_cost;
+                    via_road[road.to] = Some(road_id);
+                    prev_intersection[road.to] = Some(intersection);
+                    heap.push(DijkstraState {
+                        cost: next_cost,
+                        intersection: road.to,
+                    });
+                }
+            }
         }
-        route
+
+        if dist[dest_intersection].is_infinite() {
+            return None; // unreachable from here in this city's current graph
+        }
+
+        // Walk the via_road/prev_intersection chain back from destination to
+        // start, then reverse into travel order.
+        let mut route = Vec::new();
+        let mut cur = dest_intersection;
+        while let Some(road_id) = via_road[cur] {
+            route.push(road_id);
+            cur = prev_intersection[cur].expect("via_road implies prev_intersection is set");
+            if cur == start_intersection {
+                break;
+            }
+        }
+        route.reverse();
+        Some(route)
+    }
+
+    /// Build a full spawn-to-destination route starting from `start_road`:
+    /// sample a hub-biased destination, then Dijkstra-route from the far
+    /// end of `start_road` to it, prepending `start_road` itself. Falls
+    /// back to just `[start_road]` (vehicle immediately exits after this
+    /// one road) if no route is found -- e.g. a destination that turns out
+    /// unreachable because of stochastic road pruning -- rather than
+    /// panicking or retrying indefinitely.
+    fn route_with_destination(&mut self, start_road: usize) -> Vec<usize> {
+        let start_intersection = self.city.roads[start_road].to;
+        let dest = self.sample_destination(start_intersection);
+        match self.shortest_route(start_intersection, dest) {
+            Some(rest) if !rest.is_empty() => {
+                let mut route = vec![start_road];
+                route.extend(rest);
+                route
+            }
+            _ => vec![start_road],
+        }
     }
 
     fn alloc_vehicle(&mut self, v: Vehicle) -> usize {
@@ -189,7 +354,7 @@ impl Simulation {
                 continue; // road is full, no room to spawn
             }
             if self.rng.gen_bool((intensity * self.config.spawn_scale).min(1.0)) {
-                let route = self.random_route(road_idx);
+                let route = self.route_with_destination(road_idx);
                 let vid = self.alloc_vehicle(Vehicle {
                     route,
                     route_pos: 0,
@@ -218,6 +383,12 @@ impl Simulation {
         self.completed_this_tick = 0;
         self.stall_events_this_tick = 0;
         let mut total_wait_this_tick: u64 = 0;
+        for w in self.wait_by_intersection.iter_mut() {
+            *w = 0;
+        }
+        for s in self.stall_by_intersection.iter_mut() {
+            *s = 0;
+        }
 
         // Process movement road-by-road. Each road advances at most its front
         // (head-of-queue) vehicle per tick while its phase group is green --
@@ -254,6 +425,7 @@ impl Simulation {
                 let was_stopped = self.vehicles[vid].as_ref().unwrap().is_stopped;
                 if was_stopped {
                     self.stall_events_this_tick += 1;
+                    self.stall_by_intersection[to_intersection] += 1;
                 }
                 if is_last_hop {
                     self.completed_this_tick += 1;
@@ -274,12 +446,15 @@ impl Simulation {
             }
 
             // vehicles queued behind the one that just moved also accrue wait
+            let mut behind_n = 0u64;
             for &qvid in self.queues[road_idx].iter() {
                 let v = self.vehicles[qvid].as_mut().unwrap();
                 v.wait_ticks += 1;
                 v.is_stopped = true;
-                total_wait_this_tick += 1;
+                behind_n += 1;
             }
+            total_wait_this_tick += behind_n;
+            self.wait_by_intersection[to_intersection] += behind_n;
         }
 
         self.spawn_vehicles();
@@ -291,13 +466,35 @@ impl Simulation {
         (self.observe(), reward, done)
     }
 
+    /// Per-intersection reward for this tick: same shaping as the global
+    /// scalar reward (negative wait + stall_penalty-weighted stalls) but
+    /// computed only from wait/stall events accrued on roads feeding INTO
+    /// that intersection. This is what a shared per-intersection policy
+    /// should actually train against -- each agent's reward reflects only
+    /// congestion it could plausibly have influenced with its own phase
+    /// choice, not city-wide congestion diluted across every agent equally.
+    /// Without this, agent-level credit assignment gets noisier as the city
+    /// grows, which would undermine the whole point of a shared policy
+    /// that's meant to generalize to arbitrary city sizes.
+    pub fn rewards_per_intersection(&self) -> Vec<f32> {
+        self.wait_by_intersection
+            .iter()
+            .zip(self.stall_by_intersection.iter())
+            .map(|(&w, &s)| -(w as f32 + self.config.stall_penalty * s as f32))
+            .collect()
+    }
+
     fn accumulate_wait(&mut self, road_idx: usize, total_wait_this_tick: &mut u64) {
+        let to_intersection = self.city.roads[road_idx].to;
+        let mut n = 0u64;
         for &qvid in self.queues[road_idx].iter() {
             let v = self.vehicles[qvid].as_mut().unwrap();
             v.wait_ticks += 1;
             v.is_stopped = true;
-            *total_wait_this_tick += 1;
+            n += 1;
         }
+        *total_wait_this_tick += n;
+        self.wait_by_intersection[to_intersection] += n;
     }
 
     pub fn metrics(&self) -> TickMetrics {
@@ -451,6 +648,108 @@ mod tests {
             sim.vehicles.len() < 3000,
             "expected slot reuse to bound arena growth, got {}",
             sim.vehicles.len()
+        );
+    }
+
+    #[test]
+    fn per_intersection_rewards_sum_to_global_reward() {
+        // Localized rewards are just a bucketed decomposition of the same
+        // wait/stall accounting the global reward uses -- summing them
+        // back up must reproduce the global scalar exactly (mod float
+        // rounding), or the localization introduced a real accounting bug.
+        let params = CityGenParams {
+            grid_w: 4,
+            grid_h: 4,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(7, params, SimConfig { max_ticks: 200, ..Default::default() });
+        sim.reset(7);
+        let n = sim.num_intersections();
+        for _ in 0..200 {
+            let actions = vec![0u8; n];
+            let (_, global_reward, _) = sim.step(&actions);
+            let per_int = sim.rewards_per_intersection();
+            assert_eq!(per_int.len(), n);
+            let summed: f32 = per_int.iter().sum();
+            assert!(
+                (summed - global_reward).abs() < 1e-2,
+                "summed per-intersection reward {} != global reward {}",
+                summed,
+                global_reward
+            );
+        }
+    }
+
+    #[test]
+    fn routes_reach_sampled_destination_via_valid_road_chain() {
+        // Every road in a spawned route must actually connect: road[i].to
+        // must equal road[i+1].from, and the final road's `to` should be
+        // the intersection the vehicle was actually routed toward. This is
+        // the core correctness property of real OD routing (replacing the
+        // old random-walk router): routes must be traversable, not just
+        // plausible-looking.
+        let params = CityGenParams {
+            grid_w: 5,
+            grid_h: 5,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(13, params, SimConfig { max_ticks: 300, ..Default::default() });
+        sim.reset(13);
+        for start_road in 0..sim.city.roads.len().min(30) {
+            let route = sim.route_with_destination(start_road);
+            assert_eq!(route[0], start_road, "route must begin with the spawn road");
+            for w in route.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                assert_eq!(
+                    sim.city.roads[a].to, sim.city.roads[b].from,
+                    "route road {} -> {} is not a valid chain",
+                    a, b
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn destinations_skew_toward_hub_zones() {
+        // sample_destination should pick high-zone_weight intersections
+        // more often than low-zone_weight ones over many draws -- the
+        // actual behavioral difference vs uniform-random destination
+        // sampling.
+        let params = CityGenParams {
+            grid_w: 6,
+            grid_h: 6,
+            num_hubs: 1,
+            hub_falloff: 1.2,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(4, params, SimConfig { max_ticks: 100, ..Default::default() });
+        sim.reset(4);
+        let n = sim.city.intersections.len();
+        let mut hub_picks = 0u32;
+        let mut total = 0u32;
+        let high_weight_threshold = 0.6;
+        for _ in 0..500 {
+            let dest = sim.sample_destination(usize::MAX); // exclude nothing reachable
+            if sim.city.intersections[dest].zone_weight > high_weight_threshold {
+                hub_picks += 1;
+            }
+            total += 1;
+        }
+        let hub_intersections = sim
+            .city
+            .intersections
+            .iter()
+            .filter(|i| i.zone_weight > high_weight_threshold)
+            .count();
+        // If sampling were uniform, hub picks would roughly match
+        // hub_intersections / n. With hub bias, hub picks should exceed
+        // that uniform baseline by a clear margin.
+        let uniform_expected = (hub_intersections as f32 / n as f32) * total as f32;
+        assert!(
+            hub_picks as f32 > uniform_expected * 1.3,
+            "hub_picks {} not clearly above uniform baseline {}",
+            hub_picks,
+            uniform_expected
         );
     }
 

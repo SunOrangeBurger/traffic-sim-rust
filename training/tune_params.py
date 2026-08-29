@@ -4,6 +4,16 @@ parameter range where traffic is neither empty (no learning signal) nor
 permanently gridlocked (also no learning signal, and it would make the
 "agent clears congestion" demo impossible since nothing can clear it).
 
+Averages over multiple seeds per (grid, spawn_scale) cell. Hub cluster
+placement is randomized per-city (see core/src/city.rs), so any single seed
+can land two hubs adjacently and produce a fluke over-dense city regardless
+of grid size -- confirmed via --diagnose-hub-variance, which showed ~19x
+avg_active spread across seeds at a FIXED size and spawn_scale. A one-seed
+sweep therefore reads seed luck, not the size's actual typical behavior;
+this file reports mean and worst-case across seeds instead so the resulting
+spawn_scale choice reflects what stage-2 training will actually see across
+a random seed pool, not one arbitrary hub roll.
+
 stall_penalty is intentionally NOT swept here: it doesn't affect simulation
 dynamics at all, only reward scale. Sweep it later, during training, by
 watching whether PPO's reward curve is dominated by one term.
@@ -74,25 +84,83 @@ def run_once(grid_w, grid_h, spawn_scale, seed=42, run_ticks=RUN_TICKS):
 
 
 if __name__ == "__main__":
-    grids = [(3, 3), (4, 4), (6, 6)]
-    spawn_scales = [0.02, 0.04, 0.06, 0.08, 0.12]
+    import sys
 
-    print(f"{'grid':<8}{'spawn_scale':<13}{'avg_active':<12}{'completed':<11}{'stalls':<9}{'growth':<9}verdict")
-    for grid_w, grid_h in grids:
-        prev_completed = None
-        for ss in spawn_scales:
-            r = run_once(grid_w, grid_h, ss)
-            # Real gridlock signature: throughput should rise monotonically
-            # with spawn rate in a healthy network. A DROP in completions
-            # despite a higher spawn rate means the network has collapsed --
-            # this catches saturate-immediately cases the growth-ratio
-            # heuristic misses (it only flags "still getting worse", not
-            # "already maxed out by the time we started measuring").
-            throughput_collapsed = prev_completed is not None and r["completed"] < prev_completed
-            if throughput_collapsed:
-                r["verdict"] = "GRIDLOCKED (throughput collapsed)"
-            prev_completed = r["completed"]
+    if "--diagnose-hub-variance" in sys.argv:
+        # One-off diagnostic: is the 5x5-vs-6x6 non-monotonicity in the main
+        # sweep a real size effect, or an artifact of hub_centers being
+        # drawn from a single fixed seed (42) per size, so different sizes
+        # just happen to get luckier/unluckier hub layouts? Runs several
+        # seeds per size at a fixed mid-range spawn_scale and reports the
+        # SPREAD across seeds -- if within-size seed variance is as large
+        # as the between-size gap seen in the main sweep, that confirms
+        # it's noise, not a structural size effect.
+        #
+        # CONFIRMED (see progress log): within one grid size, avg_active
+        # swings ~19x across seeds (57.8 to 1071.2 at 6x6, spawn_scale=0.05)
+        # purely from hub-placement luck -- a bigger spread than the
+        # apparent between-size gap in the single-seed main sweep. Decision:
+        # kept as-is (real road networks have unlucky bottleneck layouts
+        # too), so the main sweep below now averages over multiple seeds
+        # per cell instead of trusting any single seed.
+        DIAG_SPAWN_SCALE = 0.05
+        DIAG_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8]
+        print(f"Diagnostic: spawn_scale={DIAG_SPAWN_SCALE}, seeds={DIAG_SEEDS}")
+        print(f"{'grid':<8}{'seed':<6}{'avg_active':<12}{'completed':<11}{'growth':<9}verdict")
+        for grid_w, grid_h in [(5, 5), (6, 6)]:
+            results = []
+            for seed in DIAG_SEEDS:
+                r = run_once(grid_w, grid_h, DIAG_SPAWN_SCALE, seed=seed)
+                results.append(r)
+                print(
+                    f"{r['grid']:<8}{seed:<6}{r['avg_active']:<12.1f}"
+                    f"{r['completed']:<11}{r['growth_ratio']:<9.2f}{r['verdict']}"
+                )
+            avg_actives = [r["avg_active"] for r in results]
             print(
-                f"{r['grid']:<8}{r['spawn_scale']:<13}{r['avg_active']:<12.1f}"
-                f"{r['completed']:<11}{r['stalls']:<9}{r['growth_ratio']:<9.2f}{r['verdict']}"
+                f"  -> {grid_w}x{grid_h} avg_active across seeds: "
+                f"min={min(avg_actives):.1f} max={max(avg_actives):.1f} "
+                f"mean={sum(avg_actives)/len(avg_actives):.1f}"
+            )
+        sys.exit(0)
+
+    # 5x5 added: stage-2 trains across a size range (3x3-6x6) and needs the
+    # midpoint covered too, not just the endpoints, since a shared policy
+    # will actually see this size during training.
+    grids = [(3, 3), (4, 4), (5, 5), (6, 6)]
+    spawn_scales = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]
+    # Hub placement is randomized per-city (see diagnose-hub-variance above),
+    # so any single seed can land a fluke dense or fluke sparse layout.
+    # Averaging over several seeds per cell is what makes this sweep read
+    # the TYPICAL healthy zone rather than one arbitrary hub roll.
+    TUNE_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    print(
+        f"{'grid':<8}{'spawn_scale':<13}{'mean_active':<13}{'worst_active':<14}"
+        f"{'gridlock_rate':<15}verdict"
+    )
+    for grid_w, grid_h in grids:
+        for ss in spawn_scales:
+            per_seed = [run_once(grid_w, grid_h, ss, seed=s) for s in TUNE_SEEDS]
+            actives = [r["avg_active"] for r in per_seed]
+            # A seed counts as "gridlocked" for this cell using the same
+            # signal run_once already computes per-seed: high growth_ratio
+            # (still-rising congestion) is the honest per-seed proxy here,
+            # since the throughput-collapse comparison needs a previous
+            # spawn_scale at the SAME seed, which this seed-averaged view
+            # doesn't track -- growth_ratio alone is sufficient to flag the
+            # runaway cases seen in the diagnostic (all were growth_ratio
+            # 2.5+).
+            gridlocked_seeds = sum(1 for r in per_seed if r["growth_ratio"] > 1.4)
+            mean_active = sum(actives) / len(actives)
+            worst_active = max(actives)
+            gridlock_rate = gridlocked_seeds / len(TUNE_SEEDS)
+            verdict = (
+                "too sparse" if mean_active < 2
+                else f"UNSTABLE ({gridlocked_seeds}/{len(TUNE_SEEDS)} seeds gridlocked)" if gridlock_rate > 0
+                else "ok"
+            )
+            print(
+                f"{grid_w}x{grid_h:<6}{ss:<13}{mean_active:<13.1f}{worst_active:<14.1f}"
+                f"{gridlock_rate:<15.2f}{verdict}"
             )

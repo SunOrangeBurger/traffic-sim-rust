@@ -22,6 +22,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 
 from gym_env import TrafficGymEnv
+from spawn_scale_lookup import safe_spawn_scale
 
 
 class EpisodeRewardLogger(BaseCallback):
@@ -81,13 +82,21 @@ class EpisodeRewardLogger(BaseCallback):
 
 
 def make_env(grid_w, grid_h, max_ticks, seed_pool):
+    # spawn_scale is looked up per grid size rather than hardcoded: a value
+    # safe for one grid size can gridlock a different one, since num_hubs
+    # stays fixed while hub density (hubs per intersection) drops as the
+    # grid grows -- see spawn_scale_lookup.py for the sweep this is built
+    # from. Assumes a square grid; safe_spawn_scale is defined in terms of
+    # a single side length.
+    assert grid_w == grid_h, "safe_spawn_scale lookup assumes a square grid"
+    spawn_scale = safe_spawn_scale(grid_w)
     return Monitor(
         TrafficGymEnv(
             grid_w=grid_w,
             grid_h=grid_h,
             max_ticks=max_ticks,
             seed_pool=seed_pool,
-            spawn_scale=0.06,
+            spawn_scale=spawn_scale,
             stall_penalty=3.0,
         )
     )
