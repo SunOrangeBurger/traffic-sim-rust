@@ -1,0 +1,11 @@
+[package]
+name = "traffic_sim_core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "traffic_sim_core"
+crate-type = ["rlib"]
+
+[dependencies]
+rand = "0.8"

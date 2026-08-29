@@ -1,0 +1,14 @@
+[package]
+name = "traffic_sim_py"
+version = "0.1.0"
+edition = "2021"
+
+# The compiled .so is imported in Python as `traffic_sim` (see [lib] name below
+# and the #[pymodule] name in src/lib.rs) -- keep these three in sync.
+[lib]
+name = "traffic_sim"
+crate-type = ["cdylib"]
+
+[dependencies]
+traffic_sim_core = { path = "../core" }
+pyo3 = { version = "0.20", features = ["extension-module"] }
