@@ -60,6 +60,9 @@ pub struct Road {
     pub from: usize,
     pub to: usize,
     pub length: f32,
+    /// Max vehicles allowed to queue at this road's intersection end,
+    /// waiting on the light. Distinct from `transit_capacity` (see below) --
+    /// this is the "at the light" cap, not the "on the road" cap.
     pub capacity: usize,
     pub class: RoadClass,
     /// 0.0..=1.0 spawn-rate multiplier. Derived from the zone_weight of the
@@ -68,6 +71,34 @@ pub struct Road {
     /// density (busy corridors) instead of random per-road noise.
     pub base_intensity: f32,
     pub phase_group: PhaseGroup,
+    /// Ticks a vehicle spends physically driving this road before it
+    /// reaches the intersection-queue. Derived from `length` and `class`
+    /// (arterials move faster per unit length, not just wider). This is
+    /// what gives the road a real travel time -- previously a vehicle
+    /// crossed any road in exactly one tick regardless of length, so
+    /// "longer route" only cost more in the router's planning-time cost
+    /// function, never in actual simulated travel time.
+    pub travel_ticks: u32,
+    /// Max vehicles that can be mid-road ("driving", not yet queued at the
+    /// light) simultaneously. Derived from `length` and `class`. Distinct
+    /// from `capacity` -- a road can be full of moving traffic without a
+    /// single vehicle having reached its queue yet, which is what lets
+    /// "busy but flowing" be a real, distinguishable state from "jammed at
+    /// the light".
+    pub transit_capacity: usize,
+    /// Vehicles allowed to advance from this road's queue into the next
+    /// road per green tick (previously hardcoded to 1 for every road
+    /// regardless of class). Wider/higher-class roads clear more vehicles
+    /// per green, which is what makes signal *timing* matter more on busy
+    /// arterials than on a one-lane local street.
+    pub saturation_flow: usize,
+    /// True for a grade-separated bypass (e.g. a flyover) that skips the
+    /// destination intersection's phase check entirely -- always flows,
+    /// subject only to its own capacity/saturation_flow. False for every
+    /// ordinary signaled road. Not yet used by city generation (Phase 2);
+    /// present now so `sim.rs`'s phase-check logic has a stable field to
+    /// read.
+    pub grade_separated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -251,16 +282,51 @@ fn add_road(
         PhaseGroup::EastWest
     };
 
+    let length = rng.gen_range(80.0..220.0f32);
+
+    // Effective travel speed (length units per tick) by class -- arterials
+    // move faster per unit length, not just wider. These are relative
+    // units (length itself is arbitrary 80..220), tuned so a typical
+    // arterial crosses in a handful of ticks and a typical local street
+    // takes noticeably longer per unit length, not just less capacity.
+    let speed = match class {
+        RoadClass::Arterial => 22.0,
+        RoadClass::Collector => 15.0,
+        RoadClass::Local => 10.0,
+    };
+    let travel_ticks = ((length / speed).round() as u32).max(1);
+
+    // Physical space on the road for moving-but-not-yet-queued vehicles,
+    // scaled by length (longer road, more room to spread out) and a
+    // class-based density factor (arterials pack more vehicles per unit
+    // length -- more effective lanes -- than a local street).
+    let density_factor = match class {
+        RoadClass::Arterial => 0.12,
+        RoadClass::Collector => 0.08,
+        RoadClass::Local => 0.05,
+    };
+    let transit_capacity = ((length * density_factor).round() as usize).max(2);
+
+    let saturation_flow = match class {
+        RoadClass::Arterial => 3,
+        RoadClass::Collector => 2,
+        RoadClass::Local => 1,
+    };
+
     let id = roads.len();
     roads.push(Road {
         id,
         from,
         to,
-        length: rng.gen_range(80.0..220.0),
+        length,
         capacity,
         class,
         base_intensity: intensity,
         phase_group,
+        travel_ticks,
+        transit_capacity,
+        saturation_flow,
+        grade_separated: false,
     });
     intersections[from].outgoing.push(id);
     intersections[to].incoming.push(id);

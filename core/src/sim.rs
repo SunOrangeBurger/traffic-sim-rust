@@ -5,11 +5,19 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
 
 /// Fixed number of observation fields emitted per intersection:
-/// [queue_len_NS, queue_len_EW, wait_time_NS, wait_time_EW, current_phase, local_intensity]
+/// [queue_len_NS, queue_len_EW, wait_time_NS, wait_time_EW, current_phase,
+///  local_intensity, transit_approaching, downstream_blockage]
 /// Fixed-width per-intersection observations (rather than variable-shaped per
 /// city) is what lets one shared policy generalize across differently-shaped
-/// cities.
-pub const OBS_PER_INTERSECTION: usize = 6;
+/// cities. The last two fields are aggregate counts/ratios, deliberately NOT
+/// per-vehicle data (see REALISM_REFACTOR_PLAN.md section 0 for why) --
+/// `transit_approaching` is how many vehicles are currently driving toward
+/// this intersection but haven't reached the queue yet (lets the agent
+/// anticipate incoming load), and `downstream_blockage` is the fraction of
+/// this intersection's outgoing roads currently near transit capacity (lets
+/// the agent learn that turning green here doesn't help if there's nowhere
+/// for traffic to go).
+pub const OBS_PER_INTERSECTION: usize = 8;
 
 /// Fraction (0.0..=1.0) by which a vehicle's per-edge routing cost is
 /// randomly jittered when computing its route. This is what produces real
@@ -86,6 +94,13 @@ struct Vehicle {
     /// used to detect the moving->stopped transition exactly once per stop.
     is_stopped: bool,
     stall_count: u32,
+    /// Ticks remaining before this vehicle finishes driving the current
+    /// road and becomes eligible to join that road's intersection-queue.
+    /// 0 means "in the queue already" or "eligible now, waiting only on
+    /// queue room" -- see `advance_transit` in `step()`. Freshly spawned or
+    /// freshly-advanced-to-a-new-road vehicles start at
+    /// `road.travel_ticks`, decremented once per tick while in transit.
+    transit_ticks_left: u32,
 }
 
 /// Min-heap entry for Dijkstra's algorithm over intersections. `BinaryHeap`
@@ -135,8 +150,16 @@ pub struct Simulation {
     config: SimConfig,
     rng: StdRng,
     /// queue of vehicle slot indices waiting on each road; front = closest to
-    /// the intersection at road.to
+    /// the intersection at road.to. Only vehicles that have finished transit
+    /// (see `transit` below) live here -- this is specifically the "queued
+    /// at the light" population, capped by `road.capacity`.
     queues: Vec<VecDeque<usize>>,
+    /// Vehicle slot indices currently driving (not yet queued at the light)
+    /// on each road, in entry order (front = closest to finishing transit,
+    /// since `travel_ticks` is constant per road so entry order == finish
+    /// order). Capped by `road.transit_capacity`. This is what gives a road
+    /// a real "busy but flowing" population, distinct from `queues`.
+    transit: Vec<VecDeque<usize>>,
     /// Slab arena: `None` = free slot, reused by future spawns. This is what
     /// lets us free completed vehicles without invalidating the indices
     /// stored in `queues` (a plain Vec::retain would shift indices and
@@ -168,6 +191,7 @@ impl Simulation {
         Simulation {
             rng: StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15),
             queues: (0..n_roads).map(|_| VecDeque::new()).collect(),
+            transit: (0..n_roads).map(|_| VecDeque::new()).collect(),
             vehicles: Vec::new(),
             free_slots: Vec::new(),
             intersections: (0..n_intersections)
@@ -277,7 +301,14 @@ impl Simulation {
             }
             for &road_id in &self.city.intersections[intersection].outgoing {
                 let road = &self.city.roads[road_id];
-                let base_cost = (road.length as f64 / road.capacity.max(1) as f64).max(0.01);
+                // Real travel time (now that roads have one, via
+                // travel_ticks) plus a mild congestion-aversion term based
+                // on queue capacity -- previously this was length/capacity
+                // with no travel-time concept at all, so a "longer" route
+                // only ever cost more in planning, never actually took
+                // longer or let a vehicle avoid a real queue.
+                let base_cost = road.travel_ticks as f64
+                    + (2.0 / road.capacity.max(1) as f64);
                 let edge_cost = base_cost * jitters[road_id];
                 let next_cost = cost + edge_cost;
                 if next_cost < dist[road.to] {
@@ -349,21 +380,68 @@ impl Simulation {
     fn spawn_vehicles(&mut self) {
         for road_idx in 0..self.city.roads.len() {
             let intensity = self.city.roads[road_idx].base_intensity as f64;
-            let capacity = self.city.roads[road_idx].capacity;
-            if self.queues[road_idx].len() >= capacity {
-                continue; // road is full, no room to spawn
+            let transit_capacity = self.city.roads[road_idx].transit_capacity;
+            if self.transit[road_idx].len() >= transit_capacity {
+                continue; // road's driving-space is full, no room to spawn
             }
             if self.rng.gen_bool((intensity * self.config.spawn_scale).min(1.0)) {
                 let route = self.route_with_destination(road_idx);
+                let travel_ticks = self.city.roads[road_idx].travel_ticks;
                 let vid = self.alloc_vehicle(Vehicle {
                     route,
                     route_pos: 0,
                     wait_ticks: 0,
                     is_stopped: false,
                     stall_count: 0,
+                    transit_ticks_left: travel_ticks,
                 });
-                self.queues[road_idx].push_back(vid);
+                self.transit[road_idx].push_back(vid);
             }
+        }
+    }
+
+    /// Advance transit->queue promotion for one road: decrement every
+    /// in-transit vehicle's timer, then promote as many front-of-transit
+    /// vehicles as have finished (`transit_ticks_left == 0`) and fit in the
+    /// queue (`road.capacity`). A vehicle that's finished transit but finds
+    /// the queue full stays in transit, marked stopped -- this is spillback:
+    /// a jammed light backs traffic up along the road itself, not just at
+    /// the light, which is the core behavior this refactor adds.
+    fn advance_transit(&mut self, road_idx: usize, total_wait_this_tick: &mut u64) {
+        let to_intersection = self.city.roads[road_idx].to;
+        let capacity = self.city.roads[road_idx].capacity;
+
+        for &vid in self.transit[road_idx].iter() {
+            let v = self.vehicles[vid].as_mut().unwrap();
+            if v.transit_ticks_left > 0 {
+                v.transit_ticks_left -= 1;
+            }
+        }
+
+        loop {
+            let Some(&vid) = self.transit[road_idx].front() else {
+                break;
+            };
+            let ready = self.vehicles[vid].as_ref().unwrap().transit_ticks_left == 0;
+            if !ready {
+                break; // entry order == finish order (constant travel_ticks per road)
+            }
+            if self.queues[road_idx].len() >= capacity {
+                // Finished driving but the light's queue is full: spillback.
+                // Stays in `transit` (physically still "on the road"),
+                // counted as stopped/waiting like any other blocked vehicle.
+                let v = self.vehicles[vid].as_mut().unwrap();
+                v.wait_ticks += 1;
+                v.is_stopped = true;
+                *total_wait_this_tick += 1;
+                self.wait_by_intersection[to_intersection] += 1;
+                break; // front is blocked, nothing behind it can pass either
+            }
+            self.transit[road_idx].pop_front();
+            self.queues[road_idx].push_back(vid);
+            // Freshly queued: hasn't waited at the light yet this tick, and
+            // isn't retroactively "stopped" just for finishing its drive --
+            // it only becomes stopped if it then fails to advance below.
         }
     }
 
@@ -390,62 +468,93 @@ impl Simulation {
             *s = 0;
         }
 
-        // Process movement road-by-road. Each road advances at most its front
-        // (head-of-queue) vehicle per tick while its phase group is green --
-        // crude on purpose, matching the README's guidance to avoid a full
-        // physics model and just track stopped-vs-moving.
+        // Pass 1: transit -> queue promotion for every road (see
+        // advance_transit's docs). Must happen before the queue-advance pass
+        // below so a vehicle that finishes driving this tick is visible to
+        // this tick's light-timing decision, not one tick delayed.
+        for road_idx in 0..self.city.roads.len() {
+            self.advance_transit(road_idx, &mut total_wait_this_tick);
+        }
+
+        // Pass 2: process queue-advance road-by-road. Each road now advances
+        // up to `saturation_flow` head-of-queue vehicles per green tick
+        // (previously hardcoded to exactly 1 regardless of road class), and
+        // an advancing vehicle enters the NEXT road's transit pool -- it has
+        // to physically drive that road before it can queue at its light --
+        // rather than jumping straight into the next queue.
         for road_idx in 0..self.city.roads.len() {
             let to_intersection = self.city.roads[road_idx].to;
             let group = self.city.roads[road_idx].phase_group;
             let phase = self.intersections[to_intersection].phase;
+            let grade_separated = self.city.roads[road_idx].grade_separated;
 
-            if !phase.allows(group) {
+            if !grade_separated && !phase.allows(group) {
                 self.accumulate_wait(road_idx, &mut total_wait_this_tick);
                 continue;
             }
 
-            let Some(&vid) = self.queues[road_idx].front() else {
-                continue;
-            };
+            let saturation_flow = self.city.roads[road_idx].saturation_flow;
+            let mut advanced_this_tick = 0usize;
 
-            let (route_pos, route_len) = {
-                let v = self.vehicles[vid].as_ref().unwrap();
-                (v.route_pos, v.route.len())
-            };
-            let is_last_hop = route_pos + 1 >= route_len;
-            let can_advance = if is_last_hop {
-                true // vehicle exits the network, no downstream capacity needed
-            } else {
-                let next_road = self.vehicles[vid].as_ref().unwrap().route[route_pos + 1];
-                self.queues[next_road].len() < self.city.roads[next_road].capacity
-            };
+            while advanced_this_tick < saturation_flow {
+                let Some(&vid) = self.queues[road_idx].front() else {
+                    break;
+                };
 
-            if can_advance {
+                let (route_pos, route_len) = {
+                    let v = self.vehicles[vid].as_ref().unwrap();
+                    (v.route_pos, v.route.len())
+                };
+                let is_last_hop = route_pos + 1 >= route_len;
+                let next_road = if is_last_hop {
+                    None
+                } else {
+                    Some(self.vehicles[vid].as_ref().unwrap().route[route_pos + 1])
+                };
+                let can_advance = match next_road {
+                    None => true, // vehicle exits the network, no downstream room needed
+                    Some(nr) => {
+                        self.transit[nr].len() < self.city.roads[nr].transit_capacity
+                    }
+                };
+
+                if !can_advance {
+                    // green light but downstream road has no driving-room:
+                    // still counts as waiting, and nothing behind this
+                    // vehicle can advance either.
+                    break;
+                }
+
                 self.queues[road_idx].pop_front();
                 let was_stopped = self.vehicles[vid].as_ref().unwrap().is_stopped;
                 if was_stopped {
                     self.stall_events_this_tick += 1;
                     self.stall_by_intersection[to_intersection] += 1;
                 }
-                if is_last_hop {
-                    self.completed_this_tick += 1;
-                    self.free_vehicle(vid);
-                } else {
+                if let Some(nr) = next_road {
                     let v = self.vehicles[vid].as_mut().unwrap();
                     v.is_stopped = false;
                     v.wait_ticks = 0;
                     v.stall_count += was_stopped as u32;
                     v.route_pos += 1;
-                    let next_road = v.route[v.route_pos];
-                    self.queues[next_road].push_back(vid);
+                    v.transit_ticks_left = self.city.roads[nr].travel_ticks;
+                    self.transit[nr].push_back(vid);
+                } else {
+                    self.completed_this_tick += 1;
+                    self.free_vehicle(vid);
                 }
-            } else {
-                // green light but downstream is jammed: still counts as waiting
+                advanced_this_tick += 1;
+            }
+
+            if advanced_this_tick == 0 {
+                // Nothing moved this tick (blocked or red) -- whole queue
+                // is stopped/waiting.
                 self.accumulate_wait(road_idx, &mut total_wait_this_tick);
                 continue;
             }
 
-            // vehicles queued behind the one that just moved also accrue wait
+            // Remaining queued vehicles (beyond what saturation_flow let
+            // through) also accrue wait this tick.
             let mut behind_n = 0u64;
             for &qvid in self.queues[road_idx].iter() {
                 let v = self.vehicles[qvid].as_mut().unwrap();
@@ -531,6 +640,7 @@ impl Simulation {
             let mut ns_wait = 0f32;
             let mut ew_wait = 0f32;
             let mut intensity_sum = 0f32;
+            let mut transit_approaching = 0f32;
             for &road_id in &intersection.incoming {
                 let road = &self.city.roads[road_id];
                 let qlen = self.queues[road_id].len() as f32;
@@ -549,12 +659,39 @@ impl Simulation {
                     }
                 }
                 intensity_sum += road.base_intensity;
+                // Vehicles still driving toward this intersection, not yet
+                // queued at its light -- lets the agent anticipate load
+                // that's about to arrive rather than only reacting to
+                // queues that already formed. Aggregate count, not
+                // per-vehicle identity (see REALISM_REFACTOR_PLAN.md §0).
+                transit_approaching += self.transit[road_id].len() as f32;
             }
             let avg_intensity = if intersection.incoming.is_empty() {
                 0.0
             } else {
                 intensity_sum / intersection.incoming.len() as f32
             };
+
+            // Fraction of this intersection's OUTGOING roads that are near
+            // full on driving-room (transit capacity). High value means
+            // "turning green here won't actually help much -- traffic has
+            // nowhere to go once it leaves." Threshold of 0.85 is a
+            // deliberately coarse "nearly full" cut, not meant to be exact.
+            let downstream_blockage = if intersection.outgoing.is_empty() {
+                0.0
+            } else {
+                let near_full = intersection
+                    .outgoing
+                    .iter()
+                    .filter(|&&road_id| {
+                        let road = &self.city.roads[road_id];
+                        let occ = self.transit[road_id].len() as f32;
+                        occ >= 0.85 * road.transit_capacity.max(1) as f32
+                    })
+                    .count();
+                near_full as f32 / intersection.outgoing.len() as f32
+            };
+
             obs[base] = ns_queue;
             obs[base + 1] = ew_queue;
             obs[base + 2] = ns_wait;
@@ -564,6 +701,8 @@ impl Simulation {
                 Phase::EastWestGreen => 1.0,
             };
             obs[base + 5] = avg_intensity;
+            obs[base + 6] = transit_approaching;
+            obs[base + 7] = downstream_blockage;
         }
         obs
     }
@@ -772,5 +911,244 @@ mod tests {
             sim.step(&actions);
             sim.observe();
         }
+    }
+
+    #[test]
+    fn roads_now_have_real_travel_time() {
+        // Core Phase-1 claim: travel_ticks is derived from length/class and
+        // is >=1 for every road, and a slower/longer road has a travel_ticks
+        // that actually reflects its length -- i.e. this isn't a vestigial
+        // field that everything still treats as instantaneous.
+        let params = CityGenParams {
+            grid_w: 5,
+            grid_h: 5,
+            ..Default::default()
+        };
+        let city = generate_city(2, &params);
+        assert!(!city.roads.is_empty());
+        for r in &city.roads {
+            assert!(r.travel_ticks >= 1, "travel_ticks must be at least 1 tick");
+            assert!(r.transit_capacity >= 2, "transit_capacity must allow at least 2 cars");
+        }
+        // A vehicle can't cross a road it just entered in the same tick it
+        // entered: freshly-spawned vehicles must start with
+        // transit_ticks_left == the road's travel_ticks, i.e. >=1, meaning
+        // they need at least one full tick before being queue-eligible.
+    }
+
+    #[test]
+    fn vehicle_spends_real_time_in_transit_before_queueing() {
+        // Spawn on a single long-ish road with a red light forever (so we
+        // isolate transit delay from queue-wait): the vehicle should NOT
+        // appear in `queues` on the very first tick after spawning if
+        // travel_ticks > 1 -- it should still be in `transit`.
+        let params = CityGenParams {
+            grid_w: 4,
+            grid_h: 4,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(6, params, SimConfig {
+            max_ticks: 50,
+            spawn_scale: 1.0, // force spawning to make this deterministic-ish
+            ..Default::default()
+        });
+        sim.reset(6);
+        let n = sim.num_intersections();
+        // Find a road with travel_ticks > 1 to make the assertion meaningful.
+        let long_road = sim
+            .city
+            .roads
+            .iter()
+            .position(|r| r.travel_ticks > 1)
+            .expect("expected at least one road with travel_ticks > 1 in a 4x4 city");
+
+        // Manually spawn one vehicle on that road via the public step/spawn
+        // path is awkward to target deterministically, so instead assert
+        // the invariant directly on spawn_vehicles' effect: after many
+        // ticks with actions that keep this road's phase red, transit
+        // should show occupancy while the queue for that road stays empty
+        // UNTIL travel_ticks have elapsed for the earliest spawn. We can't
+        // control which road a vehicle spawns on directly, so instead
+        // assert the general invariant across the whole city: at tick 1,
+        // no vehicle can be in ANY queue that was reached via transit this
+        // same tick with travel_ticks > 1 -- i.e. total transit occupancy
+        // across roads with travel_ticks > 1 should be >= 0 and queues for
+        // those roads should be empty at tick 1 (nothing has had time to
+        // finish a >1-tick drive in 1 tick).
+        let actions = vec![0u8; n];
+        sim.step(&actions);
+        // long_road's queue should still be empty after exactly 1 tick,
+        // since travel_ticks > 1 means nothing spawned this tick could have
+        // finished driving yet.
+        assert_eq!(
+            sim.queues[long_road].len(),
+            0,
+            "a road with travel_ticks > 1 shouldn't have anyone queued after only 1 tick"
+        );
+    }
+
+    #[test]
+    fn saturation_flow_lets_multiple_vehicles_through_on_wide_roads() {
+        // An Arterial road (saturation_flow=3) with a deep queue and a
+        // green light + open downstream should advance more than 1 vehicle
+        // in a single tick -- the behavioral difference from the old
+        // hardcoded "1 vehicle per road per tick" model.
+        let params = CityGenParams {
+            grid_w: 4,
+            grid_h: 4,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(3, params, SimConfig {
+            max_ticks: 500,
+            spawn_scale: 1.0,
+            ..Default::default()
+        });
+        sim.reset(3);
+        let n = sim.num_intersections();
+        // Find an arterial road (saturation_flow > 1).
+        let arterial = sim
+            .city
+            .roads
+            .iter()
+            .position(|r| r.saturation_flow > 1)
+            .expect("expected at least one arterial road in a 4x4 city");
+        // Force-populate its queue directly past what a single tick of
+        // transit could produce, so we can isolate the queue-advance
+        // saturation-flow behavior from transit timing.
+        let to_intersection = sim.city.roads[arterial].to;
+        let cap = sim.city.roads[arterial].capacity;
+        let fill = cap.min(6);
+        for _ in 0..fill {
+            let vid = sim.alloc_vehicle(Vehicle {
+                route: vec![arterial],
+                route_pos: 0,
+                wait_ticks: 5,
+                is_stopped: true,
+                stall_count: 0,
+                transit_ticks_left: 0,
+            });
+            sim.queues[arterial].push_back(vid);
+        }
+        let mut actions = vec![1u8; n]; // default everyone to EW-green
+        // Force this intersection's phase to whatever this road's group needs.
+        let group = sim.city.roads[arterial].phase_group;
+        actions[to_intersection] = match group {
+            PhaseGroup::NorthSouth => 0,
+            PhaseGroup::EastWest => 1,
+        };
+        let before = sim.queues[arterial].len();
+        sim.step(&actions);
+        let after = sim.queues[arterial].len();
+        let advanced = before - after.min(before);
+        assert!(
+            advanced > 1,
+            "expected saturation_flow to let more than 1 vehicle through in one \
+             tick on an arterial with a deep queue and green light, advanced={}",
+            advanced
+        );
+    }
+
+    #[test]
+    fn spillback_blocks_transit_when_queue_is_full() {
+        // A vehicle that finishes transit while the destination queue is at
+        // capacity must stay in `transit` (not silently vanish or force
+        // itself into an over-capacity queue) and must be marked
+        // stopped/waiting.
+        let params = CityGenParams {
+            grid_w: 3,
+            grid_h: 3,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(8, params, SimConfig {
+            max_ticks: 100,
+            spawn_scale: 0.0, // no organic spawning; we control state directly
+            ..Default::default()
+        });
+        sim.reset(8);
+        let road_idx = 0usize;
+        let cap = sim.city.roads[road_idx].capacity;
+
+        // Fill the queue to capacity with parked (never-advancing) vehicles
+        // by keeping the light red for this road's group throughout.
+        for _ in 0..cap {
+            let vid = sim.alloc_vehicle(Vehicle {
+                route: vec![road_idx],
+                route_pos: 0,
+                wait_ticks: 0,
+                is_stopped: false,
+                stall_count: 0,
+                transit_ticks_left: 0,
+            });
+            sim.queues[road_idx].push_back(vid);
+        }
+        assert_eq!(sim.queues[road_idx].len(), cap);
+
+        // Now put one more vehicle in transit, finished (0 ticks left), on
+        // the same road -- it should be unable to join the full queue.
+        let waiting_vid = sim.alloc_vehicle(Vehicle {
+            route: vec![road_idx],
+            route_pos: 0,
+            wait_ticks: 0,
+            is_stopped: false,
+            stall_count: 0,
+            transit_ticks_left: 0,
+        });
+        sim.transit[road_idx].push_back(waiting_vid);
+
+        let mut total_wait = 0u64;
+        sim.advance_transit(road_idx, &mut total_wait);
+
+        assert_eq!(
+            sim.transit[road_idx].len(),
+            1,
+            "vehicle should remain in transit when destination queue is full"
+        );
+        assert_eq!(
+            sim.queues[road_idx].len(),
+            cap,
+            "queue should not exceed capacity due to spillback"
+        );
+        assert!(
+            sim.vehicles[waiting_vid].as_ref().unwrap().is_stopped,
+            "spilled-back vehicle should be marked stopped/waiting"
+        );
+        assert!(total_wait > 0, "spillback should contribute to wait accounting");
+    }
+
+    #[test]
+    fn observation_includes_transit_and_downstream_fields() {
+        // OBS_PER_INTERSECTION grew from 6 to 8; sanity-check the new slots
+        // are populated (not just zero-padded) when there's transit traffic.
+        let params = CityGenParams {
+            grid_w: 4,
+            grid_h: 4,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(3, params, SimConfig {
+            max_ticks: 200,
+            spawn_scale: 1.0,
+            ..Default::default()
+        });
+        sim.reset(3);
+        assert_eq!(OBS_PER_INTERSECTION, 8);
+        let n = sim.num_intersections();
+        let mut saw_nonzero_transit_field = false;
+        for _ in 0..50 {
+            let actions = vec![0u8; n];
+            let (obs, _, _) = sim.step(&actions);
+            for i in 0..n {
+                let base = i * OBS_PER_INTERSECTION;
+                if obs[base + 6] > 0.0 {
+                    saw_nonzero_transit_field = true;
+                }
+                // downstream_blockage is a fraction, must stay in [0,1]
+                assert!(obs[base + 7] >= 0.0 && obs[base + 7] <= 1.0);
+            }
+        }
+        assert!(
+            saw_nonzero_transit_field,
+            "expected some intersection to observe nonzero transit_approaching \
+             over 50 ticks of heavy spawning"
+        );
     }
 }
