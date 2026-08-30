@@ -167,3 +167,93 @@ Fixed-timer baseline eval on the same trained city — cheap, and turns the abst
 Scale to the real seed pool on the current fixed-size env, to see how much longer convergence takes once city layout varies episode-to-episode (expect meaningfully more than 300k steps).
 Stage-2 shared-policy refactor — the architecture change that actually delivers cross-city-size generalization, which is the headline differentiator in the original pitch.
 Visualization and demo polish (phases 8–9) once there's a policy worth showing off.
+
+## Gridlock filtering (`training/gridlock_filter.py`)
+
+**Problem.** `tune_params.py`'s multi-seed sweep and `--diagnose-hub-variance`
+diagnostic already established that individual seeds can gridlock purely
+from hub-placement luck, independent of grid size or spawn_scale being
+otherwise reasonable (~19x avg_active spread across seeds at a single fixed
+6x6/spawn_scale=0.05 cell). A gridlocked seed has no learnable signal —
+queues grow unbounded regardless of signal policy, because the network's
+throughput ceiling has been exceeded, not because timing is suboptimal.
+Left in a training pool, it corrupts the reward signal; drawn live in the
+demo, it would make the agent visibly fail to clear congestion on stage —
+the one thing the demo script promises judges.
+
+**First finding: the existing `growth_ratio` detector isn't reliable enough
+to build a filter on.** Investigated it directly (not just assumed) and
+found two real problems:
+1. It's window-length dependent — re-running the same seed (6x6/0.05/seed=1)
+   at probe lengths of 500/1000/1500/2000 ticks gave growth_ratio =
+   1.06 / 2.25 / 4.95 / 3.32. The qualitative verdict (locked vs not) flips
+   depending purely on where the measurement window closes, because the
+   active-vehicle curve is often still climbing through the whole run
+   rather than settling into two comparable halves.
+2. It has a false negative on a clear case — 5x5/spawn_scale=0.06/seed=2 has
+   a tail-window active-vehicle count of 1439 (vs. ~114 median across the
+   other 7 seeds in that cell — obviously gridlocked) but growth_ratio came
+   back 1.29, under the 1.4 cutoff used in the original sweep. Confirmed by
+   rerunning the sweep's exact logic against this seed directly.
+
+**What was built instead.** `filter_gridlocked_seeds()` probes a batch of
+candidate seeds under the same naive fixed-timer baseline tune_params.py
+already uses, and compares each seed's late-window (last 20%) mean
+active-vehicle count against the *median* of that statistic across the
+batch. This separates cleanly: verified against three sweep cells from the
+original tuning data, every actually-gridlocked seed lands at 3x–16x the
+batch median, every healthy seed stays under 1.65x, with no crossover in
+any tested cell. Using the batch's own median (rather than one hardcoded
+vehicle-count cutoff) is what makes one threshold work across different
+grid sizes without retuning, since capacity scales with network size but a
+self-relative ratio doesn't need to.
+
+**Second finding, caught by deliberately trying to break the filter: a
+purely relative check has a blind spot.** Pushed spawn_scale to 0.15 at 6x6
+(well past the validated safe range) and every one of 8 seeds gridlocked
+*together* — the relative check reported zero outliers, because nothing
+stood out from an already-bad pack. Added a second, absolute check
+(`ABSOLUTE_TAIL_ACTIVE_PER_INTERSECTION_CEILING`) that raises if the
+batch's own median tail-activity (normalized per intersection) is itself
+too high, regardless of how many seeds "passed" the relative check — a
+high pass rate is exactly what uniform gridlock looks like, not evidence
+the pool is fine. This is a backstop for a badly-chosen spawn_scale, not a
+replacement for `spawn_scale_lookup.py`.
+
+**Third finding: residual gridlock exists even at the "safe" spawn_scale.**
+`spawn_scale_lookup.py`'s safe values were tuned against an 8-seed sweep.
+Ran the new filter against 50-seed pools at each grid size's safe
+spawn_scale and found a non-zero gridlock rate at 3 of 4 sizes:
+3x3 → 12%, 4x4 → 4%, 5x5 → 0%, 6x6 → 8%. Not a flaw in
+`spawn_scale_lookup.py` (its job was finding a spawn_scale where gridlock
+is rare, not impossible, across a small validation sample) — it's the
+reason a standing per-pool filter is needed in addition to a good global
+spawn_scale, rather than treating spawn_scale tuning alone as sufficient.
+
+**Wiring.** `gym_env.py` now filters its seed pool through
+`filter_gridlocked_seeds()` by default (`filter_gridlock=True`), skipped
+automatically for pools under 4 seeds (e.g. the single-city debug pool
+`seed_pool=[42]`, which doesn't have enough seeds for a meaningful median
+anyway). `train.py` now trains against a real 100-seed candidate pool
+(previously `seed_pool=[42]`, deliberately overfitting one city to validate
+the pipeline mechanically — see the Stage-1 section above) filtered once
+before constructing the env, passing `filter_gridlock=False` to
+`TrafficGymEnv` to avoid re-probing an already-filtered pool a second time.
+
+**Status:** done and tested against the pretrained module — filter logic
+verified against three sweep cells with known per-seed outcomes, the
+uniform-gridlock backstop verified by deliberately forcing it to fire, and
+the full `train.py` pipeline (filter → env → PPO) smoke-tested end-to-end
+(small timestep budget) to confirm it runs. The actual long
+multi-city 300k-step convergence run — the thing `progress_so_far.md`
+originally deferred pending this fix — hasn't been run yet; that's the
+immediate next step, not part of this fix.
+
+**Known limitation carried forward:** the filter is a pool-hygiene step
+(reject bad seeds before training), not a simulation fix — the underlying
+network-capacity cliff `tune_params.py` found (e.g. 4x4 collapsing between
+spawn_scale 0.06 and 0.08) still exists in the sim itself. If Stage-2
+broadens the grid-size range trained on, this filter should be re-validated
+at those new sizes rather than assumed to generalize, the same way
+`spawn_scale_lookup.py` explicitly refuses to extrapolate past its tested
+range.

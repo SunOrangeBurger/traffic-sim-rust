@@ -148,6 +148,41 @@ impl TrafficSim {
             .map(|i| i.zone_weight)
             .collect()
     }
+
+    /// (x, y) grid coordinates for every intersection, in intersection-id
+    /// order -- pairs positionally with zone_weights()/num_intersections.
+    /// Exposed for visualization (plotting the city as a graph).
+    #[getter]
+    fn intersection_positions(&self) -> Vec<(i32, i32)> {
+        self.inner
+            .city
+            .intersections
+            .iter()
+            .map(|i| (i.x, i.y))
+            .collect()
+    }
+
+    /// One row per road: (from_intersection_id, to_intersection_id,
+    /// road_class, capacity), where road_class is 0=Arterial, 1=Collector,
+    /// 2=Local (matches RoadClass declaration order in city.rs). Exposed
+    /// for visualization -- draw an edge from `from`'s position to `to`'s
+    /// position, styled/colored by class.
+    #[getter]
+    fn roads(&self) -> Vec<(usize, usize, u8, usize)> {
+        self.inner
+            .city
+            .roads
+            .iter()
+            .map(|r| {
+                let class_code = match r.class {
+                    traffic_sim_core::RoadClass::Arterial => 0u8,
+                    traffic_sim_core::RoadClass::Collector => 1u8,
+                    traffic_sim_core::RoadClass::Local => 2u8,
+                };
+                (r.from, r.to, class_code, r.capacity)
+            })
+            .collect()
+    }
 }
 
 #[pymodule]

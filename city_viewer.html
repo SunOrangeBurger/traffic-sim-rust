@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>City viewer</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f5f2;
+    --border: #d8d6cf;
+    --text: #24231f;
+    --text-muted: #6b6a63;
+    --arterial: #b5452e;
+    --collector: #c98a3a;
+    --local: #a7a59a;
+    --hub: #2f6f4f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  .layout {
+    display: flex;
+    height: 100vh;
+  }
+  .sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+    background: var(--panel);
+  }
+  .sidebar h1 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 4px;
+  }
+  .sidebar p.sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0 0 16px;
+  }
+  .field {
+    margin-bottom: 12px;
+  }
+  .field label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+  input[type="file"] {
+    font-size: 12px;
+    width: 100%;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin: 12px 0;
+  }
+  .stat {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+  .stat .num { font-size: 18px; font-weight: 600; }
+  .stat .label { font-size: 11px; color: var(--text-muted); }
+  .legend {
+    margin-top: 16px;
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+  .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+  .swatch {
+    width: 16px;
+    height: 3px;
+    flex-shrink: 0;
+  }
+  .swatch.dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+  .warning {
+    margin-top: 16px;
+    padding: 10px;
+    background: #fdf3e3;
+    border: 1px solid #e8c88a;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #6b4f14;
+  }
+  .canvas-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+  svg { width: 100%; height: 100%; display: block; cursor: grab; }
+  svg.grabbing { cursor: grabbing; }
+  .empty-state {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+  }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(30, 29, 25, 0.92);
+    color: #fff;
+    font-size: 11px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    line-height: 1.5;
+    white-space: nowrap;
+    display: none;
+    z-index: 10;
+  }
+  .controls {
+    position: absolute;
+    bottom: 12px;
+    right: 12px;
+    display: flex;
+    gap: 6px;
+  }
+  .controls button {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    width: 28px;
+    height: 28px;
+    font-size: 14px;
+    cursor: pointer;
+    color: var(--text);
+  }
+  .controls button:hover { background: var(--panel); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <div class="sidebar">
+    <h1>City viewer</h1>
+    <p class="sub">Load a city JSON exported from export_city.py</p>
+
+    <div class="field">
+      <label for="file-input">City JSON file</label>
+      <input type="file" id="file-input" accept=".json">
+    </div>
+
+    <div id="stats-container" style="display:none;">
+      <div class="stat-grid">
+        <div class="stat"><div class="num" id="stat-intersections">-</div><div class="label">intersections</div></div>
+        <div class="stat"><div class="num" id="stat-roads">-</div><div class="label">roads</div></div>
+        <div class="stat"><div class="num" id="stat-hubs">-</div><div class="label">hubs</div></div>
+        <div class="stat"><div class="num" id="stat-seed">-</div><div class="label">seed</div></div>
+      </div>
+    </div>
+
+    <div class="legend" id="legend" style="display:none;">
+      <div class="legend-row"><span class="swatch" style="background:var(--arterial)"></span> Arterial road</div>
+      <div class="legend-row"><span class="swatch" style="background:var(--collector)"></span> Collector road</div>
+      <div class="legend-row"><span class="swatch" style="background:var(--local)"></span> Local road</div>
+      <div class="legend-row"><span class="swatch dot" style="background:var(--hub)"></span> Hub center</div>
+      <div class="legend-row" style="margin-top:10px;">Intersection fill = zone weight (hub density, 0&ndash;1)</div>
+    </div>
+
+    <div class="warning" id="fallback-warning" style="display:none;">
+      This export has no road graph (older compiled module without the
+      <code>roads</code>/<code>intersection_positions</code> getters).
+      Showing intersections at reconstructed grid positions, colored by
+      zone_weight, with no roads or hub markers. Rebuild with
+      <code>maturin develop</code> in <code>pybindings/</code> for the full
+      map.
+    </div>
+  </div>
+
+  <div class="canvas-wrap" id="canvas-wrap">
+    <div class="empty-state" id="empty-state">Load a city JSON file to view it</div>
+    <svg id="svg" viewBox="0 0 800 800" style="display:none;"></svg>
+    <div class="tooltip" id="tooltip"></div>
+    <div class="controls" id="controls" style="display:none;">
+      <button id="zoom-in" title="Zoom in">+</button>
+      <button id="zoom-out" title="Zoom out">&minus;</button>
+      <button id="zoom-reset" title="Reset view">&#8634;</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const NS = "http://www.w3.org/2000/svg";
+const ROAD_COLORS = { arterial: "var(--arterial)", collector: "var(--collector)", local: "var(--local)" };
+const ROAD_WIDTHS = { arterial: 2.4, collector: 1.4, local: 0.7 };
+
+let viewState = { scale: 1, tx: 0, ty: 0 };
+let isPanning = false;
+let panStart = { x: 0, y: 0 };
+
+document.getElementById("file-input").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    try {
+      const data = JSON.parse(ev.target.result);
+      renderCity(data);
+    } catch (err) {
+      alert("Couldn't parse that file as JSON: " + err.message);
+    }
+  };
+  reader.readAsText(file);
+});
+
+function zoneColor(weight) {
+  // Interpolate a light neutral -> warm hub color as zone_weight rises.
+  const w = Math.max(0, Math.min(1, weight));
+  const r = Math.round(246 - w * (246 - 181));
+  const g = Math.round(245 - w * (245 - 90));
+  const b = Math.round(242 - w * (242 - 60));
+  return `rgb(${r},${g},${b})`;
+}
+
+function renderCity(data) {
+  document.getElementById("empty-state").style.display = "none";
+  document.getElementById("stats-container").style.display = "block";
+  document.getElementById("legend").style.display = "block";
+  document.getElementById("controls").style.display = "flex";
+
+  const svg = document.getElementById("svg");
+  svg.style.display = "block";
+  svg.innerHTML = "";
+
+  const fallback = !data.has_real_positions;
+  document.getElementById("fallback-warning").style.display = fallback ? "block" : "none";
+
+  document.getElementById("stat-intersections").textContent = data.num_intersections;
+  document.getElementById("stat-roads").textContent = data.roads.length;
+  document.getElementById("stat-hubs").textContent = data.hub_centers.length;
+  document.getElementById("stat-seed").textContent = data.seed;
+
+  // Compute bounds from intersection positions, with margin.
+  const xs = data.intersections.map(i => i.x);
+  const ys = data.intersections.map(i => i.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const margin = 1.5;
+  const spanX = (maxX - minX) || 1;
+  const spanY = (maxY - minY) || 1;
+
+  const W = 800, H = 800;
+  const pad = 60;
+  const scaleX = (W - 2 * pad) / (spanX + 2 * margin);
+  const scaleY = (H - 2 * pad) / (spanY + 2 * margin);
+  const scale = Math.min(scaleX, scaleY);
+
+  function toScreen(x, y) {
+    return {
+      sx: pad + (x - minX + margin) * scale,
+      sy: pad + (y - minY + margin) * scale,
+    };
+  }
+
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const root = document.createElementNS(NS, "g");
+  root.setAttribute("id", "zoom-root");
+  svg.appendChild(root);
+
+  // Roads first (so intersections draw on top).
+  const posById = {};
+  data.intersections.forEach(i => { posById[i.id] = toScreen(i.x, i.y); });
+
+  data.roads.forEach(r => {
+    const a = posById[r.from], b = posById[r.to];
+    if (!a || !b) return;
+    const line = document.createElementNS(NS, "line");
+    line.setAttribute("x1", a.sx);
+    line.setAttribute("y1", a.sy);
+    line.setAttribute("x2", b.sx);
+    line.setAttribute("y2", b.sy);
+    line.setAttribute("stroke", ROAD_COLORS[r.class] || ROAD_COLORS.local);
+    line.setAttribute("stroke-width", ROAD_WIDTHS[r.class] || ROAD_WIDTHS.local);
+    line.setAttribute("stroke-linecap", "round");
+    root.appendChild(line);
+  });
+
+  // Intersections.
+  const tooltip = document.getElementById("tooltip");
+  const canvasWrap = document.getElementById("canvas-wrap");
+  const dotR = data.num_intersections > 150 ? 2.5 : data.num_intersections > 60 ? 4 : 6;
+
+  data.intersections.forEach(i => {
+    const p = posById[i.id];
+    const circle = document.createElementNS(NS, "circle");
+    circle.setAttribute("cx", p.sx);
+    circle.setAttribute("cy", p.sy);
+    circle.setAttribute("r", dotR);
+    circle.setAttribute("fill", zoneColor(i.zone_weight));
+    circle.setAttribute("stroke", "#6b6a63");
+    circle.setAttribute("stroke-width", "0.5");
+    circle.style.cursor = "pointer";
+
+    circle.addEventListener("mousemove", (e) => {
+      tooltip.style.display = "block";
+      tooltip.style.left = (e.clientX - canvasWrap.getBoundingClientRect().left + 12) + "px";
+      tooltip.style.top = (e.clientY - canvasWrap.getBoundingClientRect().top + 12) + "px";
+      tooltip.innerHTML = `#${i.id} &middot; (${i.x}, ${i.y})<br>zone_weight: ${i.zone_weight.toFixed(3)}`;
+    });
+    circle.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+
+    root.appendChild(circle);
+  });
+
+  // Hub markers (only meaningful with real positions -- with the fallback
+  // reconstruction, hub_centers are in real city coordinates but
+  // intersections are re-plotted on a plain grid, so they won't visually
+  // align. Only draw hubs when positions are real.
+  if (!fallback) {
+    data.hub_centers.forEach(h => {
+      const p = toScreen(h.x, h.y);
+      const star = document.createElementNS(NS, "circle");
+      star.setAttribute("cx", p.sx);
+      star.setAttribute("cy", p.sy);
+      star.setAttribute("r", dotR + 5);
+      star.setAttribute("fill", "none");
+      star.setAttribute("stroke", "#2f6f4f");
+      star.setAttribute("stroke-width", "1.5");
+      star.setAttribute("stroke-dasharray", "2 2");
+      root.appendChild(star);
+    });
+  }
+
+  applyTransform();
+}
+
+function applyTransform() {
+  const root = document.getElementById("zoom-root");
+  if (!root) return;
+  root.setAttribute("transform",
+    `translate(${viewState.tx},${viewState.ty}) scale(${viewState.scale})`);
+}
+
+document.getElementById("zoom-in").addEventListener("click", () => {
+  viewState.scale = Math.min(6, viewState.scale * 1.25);
+  applyTransform();
+});
+document.getElementById("zoom-out").addEventListener("click", () => {
+  viewState.scale = Math.max(0.3, viewState.scale / 1.25);
+  applyTransform();
+});
+document.getElementById("zoom-reset").addEventListener("click", () => {
+  viewState = { scale: 1, tx: 0, ty: 0 };
+  applyTransform();
+});
+
+const svgEl = document.getElementById("svg");
+svgEl.addEventListener("mousedown", (e) => {
+  isPanning = true;
+  svgEl.classList.add("grabbing");
+  panStart = { x: e.clientX - viewState.tx, y: e.clientY - viewState.ty };
+});
+window.addEventListener("mousemove", (e) => {
+  if (!isPanning) return;
+  viewState.tx = e.clientX - panStart.x;
+  viewState.ty = e.clientY - panStart.y;
+  applyTransform();
+});
+window.addEventListener("mouseup", () => {
+  isPanning = false;
+  svgEl.classList.remove("grabbing");
+});
+svgEl.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? 0.9 : 1.1;
+  viewState.scale = Math.max(0.3, Math.min(6, viewState.scale * delta));
+  applyTransform();
+}, { passive: false });
+</script>
+</body>
+</html>

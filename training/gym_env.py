@@ -16,6 +16,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import traffic_sim
 
+from gridlock_filter import filter_gridlocked_seeds
+
 
 class TrafficGymEnv(gym.Env):
     metadata = {"render_modes": []}
@@ -28,6 +30,7 @@ class TrafficGymEnv(gym.Env):
         seed_pool=None,
         spawn_scale=0.06,
         stall_penalty=3.0,
+        filter_gridlock=True,
     ):
         super().__init__()
         self.grid_w = grid_w
@@ -39,7 +42,33 @@ class TrafficGymEnv(gym.Env):
         # list (e.g. [42]) to deliberately overfit one city while debugging;
         # use a large disjoint range at train vs. eval time for a real
         # generalization test.
-        self.seed_pool = seed_pool if seed_pool is not None else list(range(10_000))
+        raw_seed_pool = seed_pool if seed_pool is not None else list(range(10_000))
+        # Gridlocked seeds (see gridlock_filter.py) have no learnable signal
+        # -- queues grow unbounded regardless of signal policy, since the
+        # network's throughput ceiling has been exceeded rather than
+        # timing being suboptimal. Left in the pool they corrupt the
+        # reward signal during training and risk a visibly-broken demo if
+        # drawn live. Filtering needs >=4 candidate seeds (see
+        # gridlock_filter.py docstring) so single-seed debug pools
+        # (e.g. seed_pool=[42]) skip the filter automatically.
+        if filter_gridlock and len(raw_seed_pool) >= 4:
+            healthy, gridlocked, _diag = filter_gridlocked_seeds(
+                raw_seed_pool, grid_w, grid_h, spawn_scale
+            )
+            if gridlocked:
+                print(
+                    f"[gridlock_filter] rejected {len(gridlocked)}/{len(raw_seed_pool)} "
+                    f"seeds as gridlocked for grid={grid_w}x{grid_h} "
+                    f"spawn_scale={spawn_scale}: {sorted(gridlocked)}"
+                )
+            self.seed_pool = healthy
+        else:
+            self.seed_pool = raw_seed_pool
+        if not self.seed_pool:
+            raise ValueError(
+                "gridlock filter rejected every candidate seed -- spawn_scale "
+                "is likely too high for this grid size; check spawn_scale_lookup.py"
+            )
         self._rng = np.random.default_rng()
 
         self.sim = traffic_sim.TrafficSim(
