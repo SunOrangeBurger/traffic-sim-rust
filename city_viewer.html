@@ -295,6 +295,13 @@ function renderCity(data) {
     line.setAttribute("stroke", ROAD_COLORS[r.class] || ROAD_COLORS.local);
     line.setAttribute("stroke-width", ROAD_WIDTHS[r.class] || ROAD_WIDTHS.local);
     line.setAttribute("stroke-linecap", "round");
+    if (r.grade_separated) {
+      // Flyover (Phase 2): render dashed + slightly thicker so it reads as
+      // a bypass distinct from an ordinary signaled arterial, since it's
+      // otherwise the same road_class/color.
+      line.setAttribute("stroke-dasharray", "10,6");
+      line.setAttribute("stroke-width", (parseFloat(ROAD_WIDTHS[r.class] || ROAD_WIDTHS.local) + 1.5));
+    }
     root.appendChild(line);
   });
 

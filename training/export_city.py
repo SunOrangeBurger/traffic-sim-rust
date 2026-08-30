@@ -30,6 +30,14 @@ import traffic_sim
 
 def export_city(seed, grid_w, grid_h, num_hubs=2, hub_falloff=2.5,
                  extra_road_prob=0.08, arterial_prob=0.6, prune_prob=0.15):
+    # Note: flyover params (num_flyovers, flyover_min_zone_weight,
+    # flyover_speed) are Phase 2 city-gen knobs but aren't yet exposed as
+    # TrafficSim constructor kwargs in pybindings/src/lib.rs -- only the
+    # `roads()` getter's grade_separated field was added this pass. This
+    # means flyovers currently only appear here via CityGenParams::default()
+    # (num_flyovers: 2), not via a --num-flyovers CLI flag. Add the
+    # constructor kwargs in pybindings/src/lib.rs if you want this script to
+    # control flyover count/placement directly.
     sim = traffic_sim.TrafficSim(
         seed=seed, grid_w=grid_w, grid_h=grid_h,
         num_hubs=num_hubs, hub_falloff=hub_falloff,
@@ -63,12 +71,22 @@ def export_city(seed, grid_w, grid_h, num_hubs=2, hub_falloff=2.5,
     roads = []
     if has_roads:
         class_names = {0: "arterial", 1: "collector", 2: "local"}
-        for from_id, to_id, class_code, capacity in sim.roads:
+        # roads() rows grew from 4 to 5 fields in Phase 2 (added
+        # grade_separated) -- unpack defensively so this script still works
+        # against an older compiled .so that predates the flyover field,
+        # rather than hard-crashing on a tuple-length mismatch.
+        for row in sim.roads:
+            if len(row) == 5:
+                from_id, to_id, class_code, capacity, grade_separated = row
+            else:
+                from_id, to_id, class_code, capacity = row
+                grade_separated = False
             roads.append({
                 "from": from_id,
                 "to": to_id,
                 "class": class_names.get(class_code, "local"),
                 "capacity": capacity,
+                "grade_separated": grade_separated,
             })
 
     data = {

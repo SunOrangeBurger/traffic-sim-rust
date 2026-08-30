@@ -1116,6 +1116,68 @@ mod tests {
     }
 
     #[test]
+    fn grade_separated_road_ignores_destination_phase() {
+        // A flyover (grade_separated=true) must advance queued vehicles
+        // regardless of the destination intersection's signal phase --
+        // that's the entire point of grade separation (Phase 2). Force the
+        // destination phase to whatever this flyover's phase_group does
+        // NOT match, and confirm a queued vehicle still advances.
+        let params = CityGenParams {
+            grid_w: 8,
+            grid_h: 8,
+            num_hubs: 3,
+            num_flyovers: 4,
+            flyover_min_zone_weight: 0.55,
+            ..Default::default()
+        };
+        let mut sim = Simulation::new(101, params, SimConfig {
+            max_ticks: 200,
+            spawn_scale: 0.0, // we control queue contents directly
+            ..Default::default()
+        });
+        sim.reset(101);
+        let n = sim.num_intersections();
+        let flyover = sim
+            .city
+            .roads
+            .iter()
+            .position(|r| r.grade_separated)
+            .expect("expected at least one flyover in this city/seed");
+
+        let to_intersection = sim.city.roads[flyover].to;
+        let group = sim.city.roads[flyover].phase_group;
+        // Deliberately set the phase to the OPPOSITE of what this road's
+        // group would need if it were an ordinary signaled road.
+        let mismatched_phase = match group {
+            PhaseGroup::NorthSouth => 1u8, // EW-green, so NS traffic would normally be red
+            PhaseGroup::EastWest => 0u8,   // NS-green, so EW traffic would normally be red
+        };
+
+        let vid = sim.alloc_vehicle(Vehicle {
+            route: vec![flyover],
+            route_pos: 0,
+            wait_ticks: 0,
+            is_stopped: true,
+            stall_count: 0,
+            transit_ticks_left: 0, // already finished transit, sitting in queue
+        });
+        sim.queues[flyover].push_back(vid);
+
+        let mut actions = vec![0u8; n];
+        actions[to_intersection] = mismatched_phase;
+        let before = sim.queues[flyover].len();
+        sim.step(&actions);
+        let after = sim.queues[flyover].len();
+        assert!(
+            after < before,
+            "grade-separated road should advance its queue even against a \
+             mismatched signal phase, before={} after={}",
+            before,
+            after
+        );
+    }
+
+    #[test]
     fn observation_includes_transit_and_downstream_fields() {
         // OBS_PER_INTERSECTION grew from 6 to 8; sanity-check the new slots
         // are populated (not just zero-padded) when there's transit traffic.

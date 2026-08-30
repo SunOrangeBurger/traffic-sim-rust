@@ -163,12 +163,15 @@ impl TrafficSim {
     }
 
     /// One row per road: (from_intersection_id, to_intersection_id,
-    /// road_class, capacity), where road_class is 0=Arterial, 1=Collector,
-    /// 2=Local (matches RoadClass declaration order in city.rs). Exposed
-    /// for visualization -- draw an edge from `from`'s position to `to`'s
+    /// road_class, capacity, grade_separated), where road_class is
+    /// 0=Arterial, 1=Collector, 2=Local (matches RoadClass declaration
+    /// order in city.rs). `grade_separated` is true for a flyover (Phase 2)
+    /// -- exposed so a viewer can draw it distinctly (e.g. a dashed
+    /// overpass line) rather than as an ordinary signaled road. Exposed for
+    /// visualization -- draw an edge from `from`'s position to `to`'s
     /// position, styled/colored by class.
     #[getter]
-    fn roads(&self) -> Vec<(usize, usize, u8, usize)> {
+    fn roads(&self) -> Vec<(usize, usize, u8, usize, bool)> {
         self.inner
             .city
             .roads
@@ -179,7 +182,7 @@ impl TrafficSim {
                     traffic_sim_core::RoadClass::Collector => 1u8,
                     traffic_sim_core::RoadClass::Local => 2u8,
                 };
-                (r.from, r.to, class_code, r.capacity)
+                (r.from, r.to, class_code, r.capacity, r.grade_separated)
             })
             .collect()
     }

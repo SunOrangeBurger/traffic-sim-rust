@@ -215,6 +215,22 @@ if __name__ == "__main__":
         (6, 6, 0.05),
         (4, 4, 0.07),
         (5, 5, 0.06),
+        # 8x8 cells added post-Phase-2 (major_refactor.md §3 bumped the
+        # default grid to 8x8/3-hub). tune_params.py's own 8x8 sweep came
+        # back gridlock_rate=0.00 at every spawn_scale up to 0.1 -- but
+        # that verdict comes from growth_ratio, which errors&findings.md §2
+        # already proved has real false negatives (missed an obviously
+        # gridlocked 5x5/0.06/seed=2 case, ratio 1.29 vs a 1.4 cutoff, while
+        # the cell's own tail_active was 12x the other seeds' median).
+        # Trusting tune_params.py's "ok" column at 8x8 without cross-
+        # checking against THIS module's median-ratio method would repeat
+        # exactly the mistake that method was built to catch. Testing two
+        # candidates here rather than one: 0.03 and 0.04, bracketing a
+        # rough linear-scaling guess from 6x6's validated 0.04-0.05 safe
+        # range adjusted for 64 vs 36 intersections -- neither is validated
+        # yet, that's what running this file now is for.
+        (8, 8, 0.03),
+        (8, 8, 0.04),
     ]
     for grid_w, grid_h, ss in test_cells:
         seeds = list(range(1, 9))

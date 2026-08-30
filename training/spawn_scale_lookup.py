@@ -14,6 +14,7 @@ grid size:
     4x4     0.06                56.6
     5x5     0.04                56.1
     6x6     0.04                72.5
+    8x8     0.04               219.9
 
 Notably this is NOT a smooth/linear function of grid size -- it drops
 sharply from 3x3 to 5x5 then plateaus at 5x5/6x6 rather than continuing to
@@ -23,6 +24,27 @@ these 4 points would either undershoot 3x3 or overshoot 6x6 depending on
 which points anchor it. This module instead interpolates directly between
 the measured points and refuses to extrapolate past the tested range,
 since nothing here justifies guessing what e.g. 8x8 needs.
+
+8x8 point added post-Phase-2 (major_refactor.md §3 bumped
+CityGenParams::default() to grid_w=grid_h=8, num_hubs=3 -- note num_hubs
+changed too, not just grid size, so this point isn't a pure like-for-like
+extension of the num_hubs=2 series above it). Validated via
+gridlock_filter.py's median-ratio method (the module trusted over
+tune_params.py's own growth_ratio verdict -- see errors&findings.md §2 for
+why growth_ratio has confirmed false negatives) at 8 seeds, both 0.03 and
+0.04 candidates: 0.04 came back clean (no gridlocked seeds, ratios
+0.65-1.22, same healthy band as the other rows) and was chosen over 0.03
+for matching 6x6's already-validated value rather than introducing a new
+number, and for the higher resulting traffic density (more for an RL agent
+to actually learn from) with no gridlock cost. **Caveat carried over
+directly from the same section of progress_so_far.md that flagged this
+same risk for the OLDER points above:** validated at 8 seeds here, same as
+this table's other entries -- but progress_so_far.md's own later 50-seed
+re-check of those other "safe" values found nonzero residual gridlock
+(0-12%) that the original 8-seed sweep missed. This 8x8 point carries that
+identical risk and hasn't been re-checked at 50 seeds. Nothing here past
+3x3-6x6, 8x8 is genuinely tested; do not interpolate/extrapolate to 7x7 or
+anything above 8x8 without running the sweep at that size directly.
 
 Stage-2 (mixed grid sizes per episode) is the actual consumer of this: it
 needs a matching spawn_scale for whatever size it samples, not one global
@@ -39,10 +61,18 @@ _SAFE_SPAWN_SCALE_POINTS = [
     (4, 0.06),
     (5, 0.04),
     (6, 0.04),
+    (8, 0.04),
 ]
 
 MIN_TESTED_SIZE = _SAFE_SPAWN_SCALE_POINTS[0][0]
 MAX_TESTED_SIZE = _SAFE_SPAWN_SCALE_POINTS[-1][0]
+
+# NOTE: grid_side=7 falls between two tested points (6 and 8) that both
+# happen to be 0.04, so safe_spawn_scale(7) returns 0.04 -- but 7x7 itself
+# has NOT been swept. That both neighbors agree is a coincidence of this
+# particular plateau, not evidence 7x7 is safe. Re-run tune_params.py +
+# gridlock_filter.py at 7x7 directly before trusting this for anything
+# beyond a rough guess.
 
 
 def safe_spawn_scale(grid_side: int) -> float:
@@ -78,9 +108,11 @@ if __name__ == "__main__":
         (4, 0.06),
         (5, 0.04),
         (6, 0.04),
+        (8, 0.04),
         (2, 0.10),   # below range -> clamps to smallest tested
         (10, 0.04),  # above range -> clamps to largest tested
         (3.5, 0.08), # interpolated midpoint between 3x3 and 4x4 points
+        (7, 0.04),   # interpolated between 6x6 and 8x8 (both 0.04) -- see NOTE above, not itself tested
     ]
     for side, expected in checks:
         got = safe_spawn_scale(side)

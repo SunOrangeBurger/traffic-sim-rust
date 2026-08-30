@@ -127,7 +127,13 @@ if __name__ == "__main__":
     # 5x5 added: stage-2 trains across a size range (3x3-6x6) and needs the
     # midpoint covered too, not just the endpoints, since a shared policy
     # will actually see this size during training.
-    grids = [(3, 3), (4, 4), (5, 5), (6, 6)]
+    # 8x8 added: Phase 2 (major_refactor.md §3) bumped CityGenParams::default()
+    # to grid_w=grid_h=8, num_hubs=3 -- the old 3x3-6x6 range never covers
+    # this size, and hub density (hubs per intersection) is lower at 8x8
+    # than at 6x6 even with num_hubs going 2->3, so the old "safe" values
+    # can't just be assumed to extrapolate. Re-run this sweep after any
+    # further change to grid_w/grid_h/num_hubs defaults, same reasoning.
+    grids = [(3, 3), (4, 4), (5, 5), (6, 6), (8, 8)]
     spawn_scales = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10]
     # Hub placement is randomized per-city (see diagnose-hub-variance above),
     # so any single seed can land a fluke dense or fluke sparse layout.

@@ -156,21 +156,42 @@ pub struct CityGenParams {
     /// degree 1 in any direction it already has, so the network stays
     /// connected.
     pub prune_prob: f64,
+    /// Number of grade-separated "flyover" road pairs (bidirectional) added
+    /// on top of the grid + shortcut network. Each flyover connects two
+    /// high-zone_weight intersections directly (skipping the signaled
+    /// intersections between them) -- Phase 2, see major_refactor.md §3.
+    /// 0 disables flyover generation entirely (e.g. for tests/city sizes
+    /// that predate this feature and shouldn't change behavior).
+    pub num_flyovers: usize,
+    /// Only intersections at or above this zone_weight are eligible
+    /// flyover endpoints -- flyovers model bypasses between busy districts,
+    /// not shortcuts from/to the outskirts.
+    pub flyover_min_zone_weight: f32,
+    /// Flyover effective speed (length units per tick), same units as the
+    /// per-class `speed` used for travel_ticks. Higher than even Arterial
+    /// (22.0) -- that's the whole point of a grade-separated bypass: it's
+    /// long in raw `length` (point-to-point across the city) but fast
+    /// enough per unit length that its *travel_ticks* ends up competitive
+    /// with routing through several signaled intersections.
+    pub flyover_speed: f32,
 }
 
 impl Default for CityGenParams {
     fn default() -> Self {
         Self {
-            grid_w: 6,
-            grid_h: 6,
+            grid_w: 8,
+            grid_h: 8,
             extra_road_prob: 0.08,
-            num_hubs: 2,
+            num_hubs: 3,
             hub_falloff: 2.5,
             arterial_prob: 0.6,
             arterial_intensity: (0.7, 1.0),
             collector_intensity: (0.35, 0.65),
             local_intensity: (0.05, 0.3),
             prune_prob: 0.15,
+            num_flyovers: 2,
+            flyover_min_zone_weight: 0.55,
+            flyover_speed: 40.0,
         }
     }
 }
@@ -332,6 +353,136 @@ fn add_road(
     intersections[to].incoming.push(id);
 }
 
+/// Add a single grade-separated flyover road (one direction). Bypasses the
+/// normal `add_road` classification entirely -- a flyover is always
+/// `RoadClass::Arterial` (highest capacity/saturation_flow bracket, matching
+/// what a grade-separated bypass actually is) and always `grade_separated:
+/// true`, so `sim.rs`'s phase-check skips it unconditionally regardless of
+/// the signal state at its destination intersection. `length` is real
+/// point-to-point Euclidean grid distance (not grid-hop distance) since a
+/// flyover cuts straight across, and `travel_ticks` is derived from that
+/// length at `flyover_speed` -- deliberately fast enough per unit length
+/// that a long point-to-point flyover can still out-cost a multi-hop
+/// signaled route once real travel time is in the router's cost function
+/// (Phase 1 prerequisite -- see major_refactor.md §3).
+fn add_flyover(
+    roads: &mut Vec<Road>,
+    intersections: &mut [Intersection],
+    from: usize,
+    to: usize,
+    rng: &mut StdRng,
+    params: &CityGenParams,
+) {
+    let (fx, fy) = (intersections[from].x, intersections[from].y);
+    let (tx, ty) = (intersections[to].x, intersections[to].y);
+    let dx = (tx - fx) as f32;
+    let dy = (ty - fy) as f32;
+    // Real grid units, same scale as ordinary road `length` (80.0..220.0
+    // per hop) -- a flyover spanning several hops legitimately has a much
+    // larger `length` than any single ordinary road, which is expected and
+    // is what `travel_ticks` (below) has to overcome via speed, not by
+    // understating the distance.
+    let per_hop_unit = 130.0; // midpoint of the 80.0..220.0 ordinary-road range
+    let hop_dist = (dx * dx + dy * dy).sqrt().max(1.0);
+    let length = hop_dist * per_hop_unit;
+
+    let travel_ticks = ((length / params.flyover_speed.max(1.0)).round() as u32).max(1);
+
+    // Capacity/transit_capacity follow the same Arterial-class formulas as
+    // add_road's Arterial branch, so a flyover isn't implausibly roomier
+    // than an ordinary arterial per unit length -- its advantage is speed
+    // (travel_ticks), not an unrealistically larger vehicle count.
+    let capacity = rng.gen_range(18..28);
+    let density_factor = 0.12;
+    let transit_capacity = ((length * density_factor).round() as usize).max(2);
+    let saturation_flow = 3;
+
+    let phase_group = if dy.abs() >= dx.abs() {
+        PhaseGroup::NorthSouth
+    } else {
+        PhaseGroup::EastWest
+    };
+
+    let id = roads.len();
+    roads.push(Road {
+        id,
+        from,
+        to,
+        length,
+        capacity,
+        class: RoadClass::Arterial,
+        base_intensity: params.arterial_intensity.0
+            + rng.gen_range(0.0..(params.arterial_intensity.1 - params.arterial_intensity.0)),
+        phase_group,
+        travel_ticks,
+        transit_capacity,
+        saturation_flow,
+        grade_separated: true,
+    });
+    intersections[from].outgoing.push(id);
+    intersections[to].incoming.push(id);
+}
+
+/// Add `num_flyovers` bidirectional grade-separated flyover pairs, each
+/// connecting two distinct high-zone_weight intersections (eligible pool:
+/// `zone_weight >= flyover_min_zone_weight`). This is what actually models
+/// a bypass "between high-zone_weight areas" per major_refactor.md §3 --
+/// low-density outskirts intersections are never flyover endpoints, since a
+/// bypass connecting two quiet corners wouldn't be a realistic flyover
+/// candidate in the first place. Falls back to a no-op if fewer than 2
+/// eligible intersections exist (e.g. a tiny grid or a very high
+/// `flyover_min_zone_weight`) rather than panicking or lowering the bar
+/// silently -- a city that can't support a flyover just doesn't get one.
+fn add_flyovers(
+    roads: &mut Vec<Road>,
+    intersections: &mut [Intersection],
+    rng: &mut StdRng,
+    params: &CityGenParams,
+) {
+    if params.num_flyovers == 0 {
+        return;
+    }
+    let eligible: Vec<usize> = intersections
+        .iter()
+        .filter(|i| i.zone_weight >= params.flyover_min_zone_weight)
+        .map(|i| i.id)
+        .collect();
+    if eligible.len() < 2 {
+        return; // no realistic flyover candidates at this city's density
+    }
+
+    // Track already-connected pairs (either direction) so we don't waste a
+    // flyover slot re-linking two intersections already directly adjacent
+    // in the grid -- that's not a bypass, it's a redundant local road.
+    let mut used_pairs: Vec<(usize, usize)> = Vec::new();
+    let max_attempts = params.num_flyovers * 20; // generous; bail rather than loop forever on a sparse eligible pool
+    let mut placed = 0usize;
+    let mut attempts = 0usize;
+
+    while placed < params.num_flyovers && attempts < max_attempts {
+        attempts += 1;
+        let a = eligible[rng.gen_range(0..eligible.len())];
+        let b = eligible[rng.gen_range(0..eligible.len())];
+        if a == b {
+            continue;
+        }
+        let (fx, fy) = (intersections[a].x, intersections[a].y);
+        let (tx, ty) = (intersections[b].x, intersections[b].y);
+        let grid_dist = ((tx - fx).abs() + (ty - fy).abs()) as usize;
+        if grid_dist < 3 {
+            continue; // too close to be a meaningful bypass, not just a redundant grid edge
+        }
+        let key = (a.min(b), a.max(b));
+        if used_pairs.contains(&key) {
+            continue;
+        }
+        used_pairs.push(key);
+        add_flyover(roads, intersections, a, b, rng, params);
+        add_flyover(roads, intersections, b, a, rng, params);
+        placed += 1;
+    }
+}
+
 /// Generate a new city deterministically from `seed`. Same seed -> same city,
 /// which is what lets us hold out seeds for train/test generalization splits.
 pub fn generate_city(seed: u64, params: &CityGenParams) -> City {
@@ -433,6 +584,12 @@ pub fn generate_city(seed: u64, params: &CityGenParams) -> City {
         }
     }
 
+    // Grade-separated flyovers, added last -- they don't interact with the
+    // grid-adjacency or shortcut-density logic above, just connect two
+    // already-placed high-zone_weight intersections directly. Phase 2, see
+    // major_refactor.md §3.
+    add_flyovers(&mut roads, &mut intersections, &mut rng, params);
+
     City {
         intersections,
         roads,
@@ -476,6 +633,7 @@ mod tests {
             grid_h: 3,
             extra_road_prob: 0.0,
             prune_prob: 0.0, // isolate this test to the shortcut-road count claim
+            num_flyovers: 0, // ditto -- flyovers are a separate road-count source (Phase 2)
             ..Default::default()
         };
         let city = generate_city(7, &params);
@@ -561,6 +719,127 @@ mod tests {
             arterial_avg,
             local_avg
         );
+    }
+
+    #[test]
+    fn flyovers_are_grade_separated_and_arterial() {
+        let params = CityGenParams {
+            grid_w: 8,
+            grid_h: 8,
+            num_hubs: 3,
+            num_flyovers: 4,
+            flyover_min_zone_weight: 0.55,
+            ..Default::default()
+        };
+        let city = generate_city(101, &params);
+        let flyovers: Vec<_> = city.roads.iter().filter(|r| r.grade_separated).collect();
+        assert!(
+            !flyovers.is_empty(),
+            "expected at least one flyover on an 8x8/3-hub city"
+        );
+        for r in &flyovers {
+            assert_eq!(
+                r.class,
+                RoadClass::Arterial,
+                "flyovers should always classify as Arterial"
+            );
+            // Every non-flyover road on a signaled grid has length in
+            // 80.0..220.0; a flyover spans multiple hops so should exceed
+            // that range's max (confirms it's really point-to-point, not
+            // accidentally reusing the short grid-hop length formula).
+            assert!(
+                r.length > 220.0,
+                "flyover length {} should exceed a single grid hop's max",
+                r.length
+            );
+        }
+        // Flyovers come in bidirectional pairs.
+        assert_eq!(
+            flyovers.len() % 2,
+            0,
+            "flyovers should always be added as bidirectional pairs"
+        );
+    }
+
+    #[test]
+    fn flyover_endpoints_are_high_zone_weight() {
+        let params = CityGenParams {
+            grid_w: 8,
+            grid_h: 8,
+            num_hubs: 3,
+            num_flyovers: 4,
+            flyover_min_zone_weight: 0.55,
+            ..Default::default()
+        };
+        let city = generate_city(101, &params);
+        for r in city.roads.iter().filter(|r| r.grade_separated) {
+            assert!(
+                city.intersections[r.from].zone_weight >= params.flyover_min_zone_weight,
+                "flyover origin zone_weight {} below threshold {}",
+                city.intersections[r.from].zone_weight,
+                params.flyover_min_zone_weight
+            );
+            assert!(
+                city.intersections[r.to].zone_weight >= params.flyover_min_zone_weight,
+                "flyover destination zone_weight {} below threshold {}",
+                city.intersections[r.to].zone_weight,
+                params.flyover_min_zone_weight
+            );
+        }
+    }
+
+    #[test]
+    fn zero_flyovers_produces_no_grade_separated_roads() {
+        let params = CityGenParams {
+            grid_w: 6,
+            grid_h: 6,
+            num_flyovers: 0,
+            ..Default::default()
+        };
+        let city = generate_city(55, &params);
+        assert!(city.roads.iter().all(|r| !r.grade_separated));
+    }
+
+    #[test]
+    fn flyover_generation_is_deterministic_per_seed() {
+        let params = CityGenParams {
+            grid_w: 8,
+            grid_h: 8,
+            num_hubs: 3,
+            num_flyovers: 3,
+            ..Default::default()
+        };
+        let a = generate_city(202, &params);
+        let b = generate_city(202, &params);
+        let fa: Vec<_> = a
+            .roads
+            .iter()
+            .filter(|r| r.grade_separated)
+            .map(|r| (r.from, r.to))
+            .collect();
+        let fb: Vec<_> = b
+            .roads
+            .iter()
+            .filter(|r| r.grade_separated)
+            .map(|r| (r.from, r.to))
+            .collect();
+        assert_eq!(fa, fb);
+    }
+
+    #[test]
+    fn tiny_grid_with_no_eligible_intersections_skips_flyovers_gracefully() {
+        // flyover_min_zone_weight above what any intersection can reach
+        // should just skip flyover generation, not panic or infinite-loop.
+        let params = CityGenParams {
+            grid_w: 3,
+            grid_h: 3,
+            num_hubs: 1,
+            num_flyovers: 5,
+            flyover_min_zone_weight: 1.5, // unreachable -- zone_weight is clamped to <= 1.0
+            ..Default::default()
+        };
+        let city = generate_city(9, &params);
+        assert!(city.roads.iter().all(|r| !r.grade_separated));
     }
 
     #[test]
